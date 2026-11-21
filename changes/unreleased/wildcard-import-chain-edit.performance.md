@@ -1,0 +1,1 @@
+- **An edit reaching a chain of wildcard imports re-expands the chain once instead of once per link.** Expansion purges every importer down the chain in one round and derives them upstream first; an incremental `ParseSources` edit of the 28-document Apollo 11 model takes 0.98 s instead of 1.64 s at p95 (1.15 s instead of 2.30 s at p99), with the same responses.

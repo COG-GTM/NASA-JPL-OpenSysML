@@ -482,3 +482,61 @@ func TestRemoveDocumentRehidesAPrivatelyImportedName(t *testing.T) {
 			"the private import is still visible inside Shared", got)
 	}
 }
+
+// An edit at the end of a wildcard-import chain settles in a few rounds however
+// long the chain, to the index a fresh build produces.
+func TestEditAtTheEndOfAnImportChainSettlesInFewRounds(t *testing.T) {
+	const length = 12
+	chain := func(leaf string) map[string]string {
+		docs := map[string]string{"p00.sysml": "package P00 { part def " + leaf + "; }"}
+		for i := 1; i < length; i++ {
+			src := fmt.Sprintf("package P%02d { public import P%02d::*;", i, i-1)
+			if i > 1 {
+				src += fmt.Sprintf(" public import P%02d::*;", i-2) // a second route
+			}
+			docs[fmt.Sprintf("p%02d.sysml", i)] = src + " }"
+		}
+		return docs
+	}
+	after := chain("Renamed")
+	reused := buildIndex(t, chain("Original"))
+	addDoc(t, reused, "p00.sysml", after["p00.sysml"])
+	rounds := 0
+	for reused.expandRound(false) {
+		rounds++
+	}
+	if rounds > 3 {
+		t.Errorf("the edit took %d expansion rounds to settle, want at most 3", rounds)
+	}
+	reused.ExpandWildcardImports()
+	last := fmt.Sprintf("P%02d::", length-1)
+	if len(reused.LookupQualified(last+"Original")) != 0 || len(reused.LookupQualified(last+"Renamed")) == 0 {
+		t.Errorf("the end of the chain does not see the rename")
+	}
+	if got, want := indexState(reused), indexState(buildIndex(t, after)); got != want {
+		t.Errorf("the edit left an index a fresh build would not produce:\n%s", diffLines(want, got))
+	}
+}
+
+// N derives before E restores the E::B it resolves through, so it first falls back
+// to the global B; the next round sees its import name another namespace and redoes it.
+func TestEditReachingANestedImporterBeforeItsEnclosingReexport(t *testing.T) {
+	docs := func(member string) map[string]string {
+		return map[string]string{
+			"b.sysml":     "package B { part def Global; }",
+			"lib.sysml":   "package Lib { package B { part def " + member + "; } part def Dropped" + member + "; }",
+			"other.sysml": "package Other { public import Lib::*; }",
+			"e.sysml":     "package E { public import Other::*; package N { public import B::*; } }",
+		}
+	}
+	after := docs("Renamed")
+	reused := buildIndex(t, docs("Original"))
+	addDoc(t, reused, "lib.sysml", after["lib.sysml"])
+	reused.ExpandWildcardImports()
+	if len(reused.LookupQualified("E::N::Renamed")) == 0 || len(reused.LookupQualified("E::N::Global")) != 0 {
+		t.Errorf("E::N does not import Lib::B after the edit")
+	}
+	if got, want := indexState(reused), indexState(buildIndex(t, after)); got != want {
+		t.Errorf("the edit left an index a fresh build would not produce:\n%s", diffLines(want, got))
+	}
+}
