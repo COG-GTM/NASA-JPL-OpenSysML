@@ -112,6 +112,9 @@ type Index struct {
 	// starts with nothing dirty and records only what its own documents changed.
 	dirtyNS     map[string]nsChange
 	lastTargets *layer[string, []resolvedImport]
+	// rederived names the importers the last expansion round purged and derived
+	// again, past that round's purges; it lasts only into the next round.
+	rederived map[string]bool
 
 	// libraryDocs names the documents that hold bundled library content rather
 	// than the workspace's own, with the tier and text digest of each, and
@@ -491,6 +494,7 @@ func (idx *Index) setWildcardImports(pkgFQN, doc string, imports []WildcardImpor
 func (idx *Index) ExpandWildcardImports() {
 	idx.mustBeWritable("ExpandWildcardImports")
 	defer idx.settleSegments()
+	defer func() { idx.rederived = nil }()
 	for round := 0; round < expansionRounds; round++ {
 		if !idx.expandRound(false) {
 			return
@@ -515,9 +519,18 @@ const expansionRounds = 16
 func (idx *Index) expandRound(deriveOnly bool) bool {
 	changed := idx.dirtyNS
 	idx.dirtyNS = make(map[string]nsChange)
-	purge, derive := idx.importersToRefresh(changed, deriveOnly)
+	rederived := idx.rederived
+	idx.rederived = nil
+	purge, derive := idx.importersToRefresh(changed, rederived, deriveOnly)
 	if len(purge) == 0 && len(derive) == 0 {
 		return false
+	}
+	if len(purge) > 0 {
+		purge, derive = idx.purgeOnward(purge, derive)
+		idx.rederived = make(map[string]bool, len(purge))
+		for _, pkgFQN := range purge {
+			idx.rederived[pkgFQN] = true
+		}
 	}
 	// Every purge lands before any derivation, so that an importer deriving from
 	// another cannot copy re-exports that are about to be dropped.
@@ -535,7 +548,9 @@ func (idx *Index) expandRound(deriveOnly bool) bool {
 // ones whose re-exports no longer follow from their imports, and the ones to
 // derive — the former plus those importing a namespace that gained members. Both
 // are in name order, so the outcome does not depend on map iteration order.
-func (idx *Index) importersToRefresh(changed map[string]nsChange, deriveOnly bool) (purge, derive []string) {
+// An importer the last round rederived was derived after that round's purges, so
+// the members they took do not make it stale.
+func (idx *Index) importersToRefresh(changed map[string]nsChange, rederived map[string]bool, deriveOnly bool) (purge, derive []string) {
 	pkgFQNs := idx.wildcardMeta.keys()
 	sort.Strings(pkgFQNs)
 
@@ -549,7 +564,7 @@ func (idx *Index) importersToRefresh(changed map[string]nsChange, deriveOnly boo
 		// It is stale when an import names another namespace than it did, or when a
 		// namespace it read members from — then or now — lost some.
 		stale := !sameImports(last, now) ||
-			lostMembers(changed, last) || lostMembers(changed, now)
+			(!rederived[pkgFQN] && (lostMembers(changed, last) || lostMembers(changed, now)))
 		if stale {
 			if !deriveOnly {
 				purge = append(purge, pkgFQN)
@@ -565,6 +580,96 @@ func (idx *Index) importersToRefresh(changed map[string]nsChange, deriveOnly boo
 		}
 	}
 	return purge, derive
+}
+
+// purgeOnward widens a round's purge to every importer it reaches down the import
+// graph and orders derivation upstream first, so a chain is redone once, not once a round.
+func (idx *Index) purgeOnward(purge, derive []string) ([]string, []string) {
+	pkgFQNs := idx.wildcardMeta.keys()
+	sort.Strings(pkgFQNs)
+	readers := map[string][]string{} // namespace to the importers reading from it
+	reads := map[string][]string{}   // importer to the namespaces it reads from
+	for _, pkgFQN := range pkgFQNs {
+		last, _ := idx.lastTargets.get(pkgFQN)
+		seen := map[string]bool{}
+		for _, imports := range [][]resolvedImport{last, idx.resolveImports(pkgFQN)} {
+			for _, imp := range imports {
+				if imp.fqn == "" || imp.fqn == pkgFQN || seen[imp.fqn] {
+					continue
+				}
+				seen[imp.fqn] = true
+				readers[imp.fqn] = append(readers[imp.fqn], pkgFQN)
+				reads[pkgFQN] = append(reads[pkgFQN], imp.fqn)
+			}
+		}
+	}
+
+	purged := make(map[string]bool, len(purge))
+	for _, pkgFQN := range purge {
+		purged[pkgFQN] = true
+	}
+	for queue := slices.Clone(purge); len(queue) > 0; {
+		pkgFQN := queue[0]
+		queue = queue[1:]
+		if !idx.hasReexportsUnder(pkgFQN) {
+			continue // purging it takes nothing from its readers
+		}
+		for _, reader := range readers[pkgFQN] {
+			if !purged[reader] {
+				purged[reader] = true
+				purge = append(purge, reader)
+				queue = append(queue, reader)
+			}
+		}
+	}
+	sort.Strings(purge)
+
+	pending := make(map[string]bool, len(derive)+len(purge))
+	for _, pkgFQN := range derive {
+		pending[pkgFQN] = true
+	}
+	for _, pkgFQN := range purge {
+		pending[pkgFQN] = true
+	}
+	remaining := make([]string, 0, len(pending))
+	for pkgFQN := range pending {
+		remaining = append(remaining, pkgFQN)
+	}
+	sort.Strings(remaining)
+	ordered := make([]string, 0, len(remaining))
+	for len(remaining) > 0 {
+		// The first whose targets are all derived; on a cycle, the first.
+		next := 0
+		for i, pkgFQN := range remaining {
+			ready := true
+			for _, target := range reads[pkgFQN] {
+				if pending[target] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				next = i
+				break
+			}
+		}
+		pkgFQN := remaining[next]
+		delete(pending, pkgFQN)
+		ordered = append(ordered, pkgFQN)
+		remaining = slices.Delete(remaining, next, next+1)
+	}
+	return purge, ordered
+}
+
+// hasReexportsUnder reports whether a wildcard import surfaced anything
+// directly under pkgFQN.
+func (idx *Index) hasReexportsUnder(pkgFQN string) bool {
+	for _, fqn := range idx.children.at(pkgFQN) {
+		if len(idx.reexported.at(fqn)) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // statedImport is one wildcard import as declared: the document stating it, its
