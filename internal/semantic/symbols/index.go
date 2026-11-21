@@ -1,6 +1,7 @@
 package symbols
 
 import (
+	"container/heap"
 	"slices"
 	"sort"
 	"strings"
@@ -631,34 +632,72 @@ func (idx *Index) purgeOnward(purge, derive []string) ([]string, []string) {
 	for _, pkgFQN := range purge {
 		pending[pkgFQN] = true
 	}
-	remaining := make([]string, 0, len(pending))
+	return purge, deriveOrder(pending, reads, readers)
+}
+
+// deriveOrder orders the pending importers so each comes after the pending ones
+// it reads from, picking the first in name order whenever several are ready, and
+// breaking a cycle at the first in name order.
+func deriveOrder(pending map[string]bool, reads, readers map[string][]string) []string {
+	waits := make(map[string]int, len(pending))
 	for pkgFQN := range pending {
-		remaining = append(remaining, pkgFQN)
-	}
-	sort.Strings(remaining)
-	ordered := make([]string, 0, len(remaining))
-	for len(remaining) > 0 {
-		// The first whose targets are all derived; on a cycle, the first.
-		next := 0
-		for i, pkgFQN := range remaining {
-			ready := true
-			for _, target := range reads[pkgFQN] {
-				if pending[target] {
-					ready = false
-					break
-				}
-			}
-			if ready {
-				next = i
-				break
+		for _, target := range reads[pkgFQN] {
+			if pending[target] {
+				waits[pkgFQN]++
 			}
 		}
-		pkgFQN := remaining[next]
-		delete(pending, pkgFQN)
-		ordered = append(ordered, pkgFQN)
-		remaining = slices.Delete(remaining, next, next+1)
 	}
-	return purge, ordered
+	byName := make([]string, 0, len(pending))
+	ready := &nameHeap{}
+	for pkgFQN := range pending {
+		byName = append(byName, pkgFQN)
+		if waits[pkgFQN] == 0 {
+			*ready = append(*ready, pkgFQN)
+		}
+	}
+	sort.Strings(byName)
+	heap.Init(ready)
+
+	ordered := make([]string, 0, len(pending))
+	done := make(map[string]bool, len(pending))
+	for cycle := 0; len(ordered) < len(byName); {
+		var pkgFQN string
+		if ready.Len() > 0 {
+			pkgFQN = heap.Pop(ready).(string)
+		} else {
+			for done[byName[cycle]] {
+				cycle++
+			}
+			pkgFQN = byName[cycle]
+		}
+		if done[pkgFQN] {
+			continue
+		}
+		done[pkgFQN] = true
+		ordered = append(ordered, pkgFQN)
+		for _, reader := range readers[pkgFQN] {
+			if pending[reader] && !done[reader] {
+				if waits[reader]--; waits[reader] == 0 {
+					heap.Push(ready, reader)
+				}
+			}
+		}
+	}
+	return ordered
+}
+
+// nameHeap is a min-heap of names.
+type nameHeap []string
+
+func (h nameHeap) Len() int           { return len(h) }
+func (h nameHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h nameHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *nameHeap) Push(x any)        { *h = append(*h, x.(string)) }
+func (h *nameHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
 }
 
 // hasReexportsUnder reports whether a wildcard import surfaced anything
