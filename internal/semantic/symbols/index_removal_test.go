@@ -517,3 +517,26 @@ func TestEditAtTheEndOfAnImportChainSettlesInFewRounds(t *testing.T) {
 		t.Errorf("the edit left an index a fresh build would not produce:\n%s", diffLines(want, got))
 	}
 }
+
+// N derives before E restores the E::B it resolves through, so it first falls back
+// to the global B; the next round sees its import name another namespace and redoes it.
+func TestEditReachingANestedImporterBeforeItsEnclosingReexport(t *testing.T) {
+	docs := func(member string) map[string]string {
+		return map[string]string{
+			"b.sysml":     "package B { part def Global; }",
+			"lib.sysml":   "package Lib { package B { part def " + member + "; } part def Dropped" + member + "; }",
+			"other.sysml": "package Other { public import Lib::*; }",
+			"e.sysml":     "package E { public import Other::*; package N { public import B::*; } }",
+		}
+	}
+	after := docs("Renamed")
+	reused := buildIndex(t, docs("Original"))
+	addDoc(t, reused, "lib.sysml", after["lib.sysml"])
+	reused.ExpandWildcardImports()
+	if len(reused.LookupQualified("E::N::Renamed")) == 0 || len(reused.LookupQualified("E::N::Global")) != 0 {
+		t.Errorf("E::N does not import Lib::B after the edit")
+	}
+	if got, want := indexState(reused), indexState(buildIndex(t, after)); got != want {
+		t.Errorf("the edit left an index a fresh build would not produce:\n%s", diffLines(want, got))
+	}
+}
